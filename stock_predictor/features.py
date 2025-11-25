@@ -174,8 +174,6 @@ def engineer_features(
 
         return group
 
-    df = df.groupby("ticker", group_keys=False).apply(_per_ticker)
-
     feature_cols: List[str] = [
         "return_1d",
         "return_5d",
@@ -212,6 +210,13 @@ def engineer_features(
 
     target_cols = [f"target_return_{h}d" for h in horizons]
     model_columns = ["ticker", "date"] + feature_cols + target_cols
+
+    grouped_parts = [_per_ticker(grp) for _, grp in df.groupby("ticker")]
+    if grouped_parts:
+        df = pd.concat(grouped_parts, ignore_index=True)
+    else:
+        df = pd.DataFrame(columns=model_columns)
+
     df = df[model_columns]
 
     df[feature_cols] = df[feature_cols].fillna(0.0)

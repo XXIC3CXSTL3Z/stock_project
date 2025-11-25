@@ -80,7 +80,7 @@ def fetch_latest_prices(
         interval: bar interval (1d recommended for this demo).
         crypto: when True, auto-append -USD to bare crypto tickers for yfinance.
         cache_dir: optional directory for caching downloads (pickle).
-        align_business: align per-ticker history to business days with ffill.
+        align_business: align per-ticker history to business days with ffill (disabled automatically for crypto).
         retries/backoff: retry controls for yfinance download.
     """
     symbols: List[str] = []
@@ -95,7 +95,8 @@ def fetch_latest_prices(
     if not symbols:
         raise ValueError("No tickers provided for live fetch.")
 
-    cache_key = f"{'_'.join(symbols)}_{period}_{interval}"
+    align_prices = align_business and not crypto
+    cache_key = f"{'_'.join(symbols)}_{period}_{interval}_{'bdays' if align_prices else 'raw'}"
     cached = _load_cache(cache_dir, cache_key)
     if cached is not None and not cached.empty:
         return cached
@@ -144,7 +145,7 @@ def fetch_latest_prices(
 
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-    if align_business:
+    if align_prices:
         df = _align_business_days(df)
     _save_cache(cache_dir, cache_key, df)
     return df

@@ -221,8 +221,6 @@ def generate_recommendations(
             )
         else:
             preds_h["markowitz_weight"] = 0.0
-        else:
-            preds_h["markowitz_weight"] = 0.0
 
         if top_n is not None:
             preds_h = preds_h.head(top_n)
