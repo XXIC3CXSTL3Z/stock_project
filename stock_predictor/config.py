@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -32,4 +33,28 @@ def merge_config(cli_args: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, 
     for key, value in config.items():
         if value is not None:
             merged[key] = value
+    return merged
+
+
+def apply_env_overrides(settings: Dict[str, Any], prefix: str = "SP_") -> Dict[str, Any]:
+    """
+    Override settings with environment variables prefixed by `prefix`.
+    Strings that parse as ints/floats/bools will be cast.
+    """
+    merged = dict(settings)
+    for key in list(settings.keys()):
+        env_key = f"{prefix}{key}".upper()
+        if env_key not in os.environ:
+            continue
+        raw = os.environ[env_key]
+        if raw.lower() in {"true", "false"}:
+            merged[key] = raw.lower() == "true"
+        else:
+            try:
+                merged[key] = int(raw)
+            except ValueError:
+                try:
+                    merged[key] = float(raw)
+                except ValueError:
+                    merged[key] = raw
     return merged

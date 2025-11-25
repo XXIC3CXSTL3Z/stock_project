@@ -4,6 +4,8 @@ from typing import Sequence
 import pandas as pd
 import streamlit as st
 
+from .backtest import simulate_portfolio_nav, walk_forward_validation
+from .fetch import fetch_latest_prices
 from .recommend import (
     format_recommendations,
     generate_deep_recommendations,
@@ -47,6 +49,7 @@ def run_dashboard() -> None:
     if st.button("Run forecast"):
         tickers = _parse_tickers(tickers_text)
         with st.spinner("Running pipeline..."):
+            prices = fetch_latest_prices(tickers, period=period, crypto=crypto, cache_dir=Path("artifacts/cache"))
             if mode == "Classical":
                 preds = generate_recommendations(
                     tickers=tickers,
@@ -78,10 +81,34 @@ def run_dashboard() -> None:
         st.dataframe(preds)
         st.text(format_recommendations(preds))
 
+        price_wide = prices.pivot(index="date", columns="ticker", values="close")
+        st.subheader("Price chart")
+        st.line_chart(price_wide)
+
+        heatmap = preds.pivot_table(index="ticker", columns="horizon", values="predicted_return")
+        st.subheader("Predicted return heatmap")
+        st.dataframe(heatmap)
+
         if "markowitz_weight" in preds:
             st.subheader("Allocation (Markowitz/Risk Parity/Black-Litterman)")
             alloc = preds[["ticker", "horizon", "markowitz_weight"]]
             st.bar_chart(alloc, x="ticker", y="markowitz_weight", color="horizon")
+
+        if st.checkbox("Run quick backtest"):
+            wf = walk_forward_validation(prices=prices, horizons=horizons, window=40, model_type="random_forest")
+            nav_df, nav_metrics = simulate_portfolio_nav(
+                wf, prices, weighting=weighting, benchmark_prices=None, plots_dir=Path("artifacts")
+            )
+            if not nav_df.empty:
+                st.subheader("NAV curve")
+                st.line_chart(nav_df.set_index("date")[["nav"]])
+            st.write("Backtest metrics", nav_metrics)
+
+        history = preds.attrs.get("history")
+        if history:
+            hist_df = pd.DataFrame(history)
+            st.subheader("Training curves")
+            st.line_chart(hist_df.set_index("epoch")[["train_loss", "val_loss"]])
 
         attention_path = preds.attrs.get("attention_path")
         if attention_path:

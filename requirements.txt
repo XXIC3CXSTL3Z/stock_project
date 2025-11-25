@@ -7,3 +7,10 @@ pyyaml
 tqdm
 matplotlib
 streamlit
+optuna
+scipy
+tensorboard
+requests
+pytest
+websockets
+joblib

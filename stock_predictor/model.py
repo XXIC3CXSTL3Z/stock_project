@@ -4,6 +4,10 @@ from typing import Dict, Iterable, List, Optional, Sequence
 import joblib
 import numpy as np
 import pandas as pd
+try:  # optional dependency
+    import optuna
+except Exception:  # noqa: BLE001
+    optuna = None
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_squared_error
@@ -12,17 +16,27 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-def _make_regressor(model_type: str):
+def _make_regressor(model_type: str, params: Optional[Dict] = None):
+    params = params or {}
     if model_type == "random_forest":
         return RandomForestRegressor(
-            n_estimators=400, random_state=42, min_samples_leaf=2, n_jobs=-1
+            n_estimators=params.get("n_estimators", 400),
+            random_state=42,
+            min_samples_leaf=params.get("min_samples_leaf", 2),
+            max_depth=params.get("max_depth"),
+            n_jobs=-1,
         )
     if model_type == "linear":
         return make_pipeline(StandardScaler(), LinearRegression())
     if model_type == "ridge":
-        return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        return make_pipeline(StandardScaler(), Ridge(alpha=params.get("alpha", 1.0)))
     if model_type == "gbrt":
-        return GradientBoostingRegressor(random_state=42)
+        return GradientBoostingRegressor(
+            random_state=42,
+            n_estimators=params.get("n_estimators", 200),
+            max_depth=params.get("max_depth", 3),
+            learning_rate=params.get("learning_rate", 0.05),
+        )
     raise ValueError(f"Unsupported model type: {model_type}")
 
 
@@ -53,6 +67,7 @@ def _cross_val_rmse(
     model_type: str,
     cv_folds: int,
     target_col: str,
+    model_params: Optional[Dict] = None,
 ) -> Optional[float]:
     """Compute time-series CV RMSE for one ticker."""
     df = df.dropna(subset=list(feature_cols) + [target_col])
@@ -60,7 +75,7 @@ def _cross_val_rmse(
         return None
 
     tscv = TimeSeriesSplit(n_splits=cv_folds)
-    reg = _make_regressor(model_type)
+    reg = _make_regressor(model_type, params=model_params)
     scores = []
 
     X_all = df[feature_cols]
@@ -89,6 +104,8 @@ def train_and_predict(
     sharpe_ranking: bool = True,
     checkpoint_dir: Optional[Path] = None,
     load_checkpoints: bool = False,
+    model_params: Optional[Dict] = None,
+    regime_aware: bool = False,
 ) -> pd.DataFrame:
     """
     Fit per-ticker regressors and predict next-day returns.
@@ -118,25 +135,33 @@ def train_and_predict(
             ticker_train, feature_cols, model_type, cv_folds=cv_folds, target_col=target_col
         )
 
+        chosen_model_type = model_type
+        if regime_aware:
+            vol_est = float(ticker_train["volatility_5d"].mean(skipna=True))
+            if vol_est > 0.03:
+                chosen_model_type = "gbrt"
+            elif vol_est < 0.01:
+                chosen_model_type = "ridge"
+
         checkpoint_path = None
         if checkpoint_dir:
-            checkpoint_path = checkpoint_dir / f"{ticker}_{horizon_label}_{model_type}.joblib"
+            checkpoint_path = checkpoint_dir / f"{ticker}_{horizon_label}_{chosen_model_type}.joblib"
             checkpoints[ticker] = checkpoint_path
 
         model = None
         if load_checkpoints and checkpoint_path and checkpoint_path.exists():
             try:
                 model = joblib.load(checkpoint_path)
-                method_used = f"{model_type}_checkpoint"
+                method_used = f"{chosen_model_type}_checkpoint"
             except Exception:
                 model = None
 
         try:
             if samples >= max(min_samples, len(feature_cols) + 2):
-                model = model or _make_regressor(model_type)
+                model = model or _make_regressor(chosen_model_type, params=model_params)
                 model.fit(X, y)
                 predicted_return = float(model.predict(ticker_latest[feature_cols])[0])
-                method_used = model_type
+                method_used = chosen_model_type
             else:
                 predicted_return = float(y.mean())
                 method_used = "mean_baseline"
@@ -197,6 +222,8 @@ def tune_hyperparameters(
     model_grid: Sequence[str],
     target_col: str = "target_return_1d",
     cv_folds: int = 3,
+    bayes_trials: int = 0,
+    bayes_model: str = "random_forest",
 ) -> pd.DataFrame:
     """Simple hyperparameter / model-type sweep with walk-forward CV RMSE."""
     results = []
@@ -204,11 +231,50 @@ def tune_hyperparameters(
         rmses = []
         for ticker, ticker_train in train_df.groupby("ticker"):
             cv_rmse = _cross_val_rmse(
-                ticker_train, feature_cols, model_type=model_type, cv_folds=cv_folds, target_col=target_col
+                ticker_train,
+                feature_cols,
+                model_type=model_type,
+                cv_folds=cv_folds,
+                target_col=target_col,
             )
             if cv_rmse is not None:
                 rmses.append(cv_rmse)
         avg_rmse = float(np.mean(rmses)) if rmses else None
         results.append({"model_type": model_type, "cv_rmse": avg_rmse})
+
+    if bayes_trials and optuna is not None:
+        def objective(trial: "optuna.Trial") -> float:
+            params = {}
+            if bayes_model == "random_forest":
+                params["n_estimators"] = trial.suggest_int("n_estimators", 200, 600)
+                params["min_samples_leaf"] = trial.suggest_int("min_samples_leaf", 1, 6)
+                params["max_depth"] = trial.suggest_int("max_depth", 2, 8)
+            elif bayes_model == "gbrt":
+                params["n_estimators"] = trial.suggest_int("n_estimators", 80, 400)
+                params["learning_rate"] = trial.suggest_float("learning_rate", 0.01, 0.2)
+                params["max_depth"] = trial.suggest_int("max_depth", 2, 6)
+            rmses = []
+            for _, ticker_train in train_df.groupby("ticker"):
+                cv_rmse = _cross_val_rmse(
+                    ticker_train,
+                    feature_cols,
+                    model_type=bayes_model,
+                    cv_folds=cv_folds,
+                    target_col=target_col,
+                    model_params=params,
+                )
+                if cv_rmse is not None:
+                    rmses.append(cv_rmse)
+            return float(np.mean(rmses)) if rmses else 1e9
+
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=bayes_trials, show_progress_bar=False)
+        results.append(
+            {
+                "model_type": f"optuna_{bayes_model}",
+                "cv_rmse": study.best_value,
+                "params": study.best_params,
+            }
+        )
 
     return pd.DataFrame(results).sort_values("cv_rmse", na_position="last")

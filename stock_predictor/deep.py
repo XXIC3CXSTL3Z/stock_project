@@ -7,6 +7,12 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
+
+try:  # optional dependency
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # noqa: BLE001
+    SummaryWriter = None
+
 from tqdm.auto import tqdm
 
 
@@ -93,13 +99,83 @@ class TransformerRegressor(nn.Module):
         return self.head(z[:, -1, :]).squeeze(-1)
 
 
-def _normalize_sequences(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+class CNNLSTMRegressor(nn.Module):
+    """1D CNN feature extractor feeding an LSTM head."""
+
+    def __init__(self, input_size: int, hidden_size: int = 32, cnn_channels: int = 32, dropout: float = 0.1):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels=input_size, out_channels=cnn_channels, kernel_size=3, padding=1)
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden_size, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = x.permute(0, 2, 1)  # (batch, features, seq)
+        z = torch.relu(self.conv(z))
+        z = z.permute(0, 2, 1)  # back to (batch, seq, channels)
+        out, _ = self.lstm(z)
+        out = self.norm(out[:, -1, :])
+        out = self.dropout(out)
+        return self.head(out).squeeze(-1)
+
+
+class CrossAssetAttention(nn.Module):
+    """Multi-head attention with a global token for multi-ticker fusion."""
+
+    def __init__(self, input_size: int, hidden_size: int = 48, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.cls = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.proj = nn.Linear(input_size, hidden_size)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=n_heads, dropout=dropout, batch_first=True
+        )
+        self.ff = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Linear(hidden_size * 2, hidden_size),
+        )
+        self.head = nn.Linear(hidden_size, 1)
+        self.attn_weights: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz = x.size(0)
+        cls_token = self.cls.expand(bsz, -1, -1)
+        z = self.proj(x)
+        z = torch.cat([cls_token, z], dim=1)
+        attn_out, weights = self.attn(z, z, z, need_weights=True, average_attn_weights=False)
+        self.attn_weights = weights.detach()
+        z = attn_out + z
+        z = self.ff(z) + z
+        pooled = z[:, 0, :]
+        return self.head(pooled).squeeze(-1)
+
+
+def _normalize_sequences(
+    X: np.ndarray, rolling_norm_window: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Normalize features for stability."""
     flat = X.reshape(-1, X.shape[-1])
     mean = flat.mean(axis=0)
     std = flat.std(axis=0)
     std = np.where(std < 1e-6, 1e-6, std)
-    X_norm = (X - mean) / std
+
+    def _norm(seq: np.ndarray) -> np.ndarray:
+        if rolling_norm_window:
+            local = seq[-rolling_norm_window:]
+            mu = local.mean(axis=0)
+            sigma = local.std(axis=0)
+            sigma = np.where(sigma < 1e-6, 1e-6, sigma)
+            return (seq - mu) / sigma
+        return (seq - mean) / std
+
+    X_norm = np.stack([_norm(seq) for seq in X])
     return X_norm, mean, std
 
 
@@ -133,9 +209,13 @@ def save_checkpoint(
 def load_checkpoint(checkpoint_path: Path, arch: str, input_size: int) -> Tuple[nn.Module, dict]:
     payload = torch.load(checkpoint_path, map_location="cpu")
     if arch == "lstm":
-        model = LSTMRegressor(input_size=input_size)
+        model: nn.Module = LSTMRegressor(input_size=input_size)
     elif arch == "transformer":
         model = TransformerRegressor(input_size=input_size)
+    elif arch == "cnn_lstm":
+        model = CNNLSTMRegressor(input_size=input_size)
+    elif arch == "fusion":
+        model = CrossAssetAttention(input_size=input_size)
     else:
         raise ValueError(f"Unsupported arch {arch}")
     model.load_state_dict(payload["state_dict"])
@@ -157,13 +237,15 @@ def train_sequence_model(
     checkpoint_path: Optional[Path] = None,
     log_progress: bool = True,
     early_stopping: bool = True,
+    rolling_norm_window: Optional[int] = None,
+    tensorboard_logdir: Optional[Path] = None,
 ) -> tuple[nn.Module, np.ndarray, np.ndarray, List[dict]]:
-    """Train an LSTM/Transformer on sliding windows of engineered features with logging + checkpoints."""
+    """Train an LSTM/Transformer/CNN-LSTM on sliding windows with logging + checkpoints."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     train_df = train_df.dropna(subset=list(feature_cols) + [target_col]).copy()
 
     X, y = _prepare_sequences(train_df, feature_cols, seq_len, target_col=target_col)
-    X, mean, std = _normalize_sequences(X)
+    X, mean, std = _normalize_sequences(X, rolling_norm_window=rolling_norm_window)
     _assert_normalization(mean, std, list(feature_cols))
 
     tensor_x = torch.tensor(X, dtype=torch.float32)
@@ -188,8 +270,12 @@ def train_sequence_model(
         model: nn.Module = LSTMRegressor(input_size=input_size)
     elif arch == "transformer":
         model = TransformerRegressor(input_size=input_size)
+    elif arch == "cnn_lstm":
+        model = CNNLSTMRegressor(input_size=input_size)
+    elif arch == "fusion":
+        model = CrossAssetAttention(input_size=input_size)
     else:
-        raise ValueError("arch must be 'lstm' or 'transformer'")
+        raise ValueError("arch must be 'lstm', 'transformer', 'cnn_lstm', or 'fusion'")
 
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -199,6 +285,10 @@ def train_sequence_model(
     best_state = None
     best_val = float("inf")
     patience_ctr = 0
+    writer = None
+    if tensorboard_logdir and SummaryWriter:
+        tensorboard_logdir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tensorboard_logdir))
 
     epoch_iter = range(epochs)
     if log_progress:
@@ -233,6 +323,10 @@ def train_sequence_model(
             val_loss = float(np.mean(val_losses)) if val_losses else None
 
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+        if writer:
+            writer.add_scalar("loss/train", train_loss, epoch)
+            if val_loss is not None:
+                writer.add_scalar("loss/val", val_loss, epoch)
 
         if val_loss is not None and val_loss < best_val - 1e-5:
             best_val = val_loss
@@ -248,14 +342,18 @@ def train_sequence_model(
                 std,
                 list(feature_cols),
                 Path(checkpoint_path),
-                metadata={"arch": arch, "seq_len": seq_len},
+                metadata={"arch": arch, "seq_len": seq_len, "rolling_norm_window": rolling_norm_window},
             )
+            history_path = Path(checkpoint_path).with_suffix(".history.csv")
+            pd.DataFrame(history).to_csv(history_path, index=False)
 
         if early_stopping and val_loader and patience_ctr >= patience:
             break
 
     if best_state:
         model.load_state_dict(best_state)
+    if writer:
+        writer.close()
 
     return model, mean, std, history
 
@@ -272,6 +370,7 @@ def predict_sequence_model(
     method: str = "deep",
     horizon_label: str = "1d",
     normalization_check: bool = True,
+    rolling_norm_window: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Use a trained sequence model to predict next returns for each ticker.
@@ -290,7 +389,14 @@ def predict_sequence_model(
         if len(grp) < seq_len:
             continue
         seq = grp[feature_cols].to_numpy(dtype=np.float32)[-seq_len:]
-        seq_norm = (seq - mean) / std
+        if rolling_norm_window:
+            local = seq[-rolling_norm_window:]
+            mu = local.mean(axis=0)
+            sigma = local.std(axis=0)
+            sigma = np.where(sigma < 1e-6, 1e-6, sigma)
+            seq_norm = (seq - mu) / sigma
+        else:
+            seq_norm = (seq - mean) / std
         tensor_x = torch.tensor(seq_norm, dtype=torch.float32, device=device).unsqueeze(0)
         pred = float(model(tensor_x).cpu().item())
         rows.append(
@@ -338,3 +444,56 @@ def visualize_attention(
     plt.savefig(save_path)
     plt.close()
     return save_path
+
+
+def walk_forward_sequence_backtest(
+    features_df: pd.DataFrame,
+    feature_cols: Iterable[str],
+    seq_len: int = 10,
+    arch: str = "lstm",
+    epochs: int = 10,
+    patience: int = 3,
+    horizon_label: str = "1d",
+) -> pd.DataFrame:
+    """
+    Walk-forward backtest for deep models (slow but illustrative).
+    Trains on history up to each decision date, predicts, and records realized returns.
+    """
+    dates = sorted(features_df["date"].unique())
+    results: List[dict] = []
+    for idx in range(seq_len, len(dates) - 1):
+        date = dates[idx]
+        train_slice = features_df[features_df["date"] < date]
+        latest = features_df[features_df["date"] == date]
+        target_col = f"target_return_{horizon_label}"
+        if target_col not in features_df.columns:
+            target_col = f"target_return_{horizon_label.replace('d','')}d"
+        if train_slice.empty or latest.empty:
+            continue
+        model, mean, std, _ = train_sequence_model(
+            train_df=train_slice,
+            feature_cols=feature_cols,
+            seq_len=seq_len,
+            arch=arch,
+            epochs=epochs,
+            target_col=target_col,
+            patience=patience,
+            early_stopping=True,
+            log_progress=False,
+        )
+        preds = predict_sequence_model(
+            model, latest, feature_cols, mean, std, seq_len=seq_len, method=f"deep_{arch}", horizon_label=horizon_label
+        )
+        for _, row in preds.iterrows():
+            realized = latest[latest["ticker"] == row["ticker"]]
+            actual = realized[target_col].iloc[0] if not realized.empty else np.nan
+            results.append(
+                {
+                    "date": date,
+                    "ticker": row["ticker"],
+                    "predicted_return": row["predicted_return"],
+                    "actual_return": actual,
+                    "horizon": horizon_label,
+                }
+            )
+    return pd.DataFrame(results)

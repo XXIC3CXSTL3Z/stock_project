@@ -37,6 +37,11 @@ Offline with the sample CSV:
 python main.py rank --data sample_data/sample_prices.csv --top 3
 ```
 
+Live/alerts mode:
+```bash
+python main.py live --symbols AAPL MSFT --period 3mo --model random_forest --loop
+```
+
 Key flags:
 - `--symbols`: tickers to fetch live via yfinance (overrides `--data`).
 - `--data`: CSV path with `date,ticker,close` columns.
@@ -47,6 +52,9 @@ Key flags:
 - `--top`: number of tickers to display.
 - `--config`: load YAML/JSON config (values in the file override CLI flags).
 - `backtest` command: run walk-forward validation and print a Sharpe/return report.
+- Advanced allocation flags: `--vol-target`, `--rolling-cov-window`, `--hrp`, `--kelly`, `--horizon-weights`.
+- Bayesian tuning: `--bayes-trials` and `--bayes-model`.
+- Deep extras: `--tensorboard-logdir`, `--rolling-norm-window`, `--device`, `--horizon-weights`.
 
 Example output (truncated):
 ```
