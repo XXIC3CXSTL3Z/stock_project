@@ -1,6 +1,6 @@
 # Stock Prediction CLI
 
-Python CLI that fetches prices (or reads a CSV), engineers richer technical factors, trains classical or deep models, and suggests portfolio weights using a Markowitz-style allocation. Ships with a small sample dataset so you can run it out of the box.
+Python CLI that fetches prices (or reads a CSV), engineers richer technical factors, trains classical or deep models, and suggests portfolio weights using Markowitz / risk-parity / Black-Litterman allocations. Ships with a small sample dataset so you can run it out of the box.
 
 ## Setup
 
@@ -14,12 +14,22 @@ pip install -r requirements.txt
 
 Classical models + Markowitz:
 ```bash
-python main.py rank --symbols AAPL MSFT GOOG --period 6mo --model random_forest --cv-folds 3 --auto-top-k 8 --top 5
+python main.py rank --symbols AAPL MSFT GOOG --period 6mo --model random_forest --cv-folds 3 --auto-top-k 8 --top 5 --horizons 1 5 10 --weighting markowitz
 ```
 
 Deep models (LSTM/Transformer):
 ```bash
-python main.py deep --symbols AAPL MSFT GOOG --arch transformer --seq-len 12 --epochs 20 --top 5
+python main.py deep --symbols AAPL MSFT GOOG --arch transformer --seq-len 12 --epochs 20 --top 5 --patience 5 --horizons 1 5 10
+```
+
+Walk-forward backtest:
+```bash
+python main.py backtest --symbols AAPL MSFT GOOG --window 80 --horizons 1 5 10
+```
+
+Streamlit dashboard:
+```bash
+python -m streamlit run stock_predictor/dashboard.py
 ```
 
 Offline with the sample CSV:
@@ -31,16 +41,19 @@ Key flags:
 - `--symbols`: tickers to fetch live via yfinance (overrides `--data`).
 - `--data`: CSV path with `date,ticker,close` columns.
 - `--period`: lookback window for live fetch (1mo, 3mo, 6mo, 1y, etc.).
-- `rank` command: `--model` (random_forest, linear, ridge, gbrt), `--cv-folds`, `--auto-top-k`, `--risk-aversion`, `--no-markowitz`.
-- `deep` command: `--arch` (lstm, transformer), `--seq-len`, `--epochs`, `--auto-top-k`, `--risk-aversion`, `--no-markowitz`.
+- `--crypto`: treat tickers as crypto symbols (auto-append `-USD`).
+- `rank` command: `--model` (random_forest, linear, ridge, gbrt), `--cv-folds`, `--auto-top-k`, `--risk-aversion`, `--horizons`, `--weighting` (markowitz, risk_parity, black_litterman), `--no-shrink-cov`, `--checkpoint-dir`, `--hyper-grid` for tuning.
+- `deep` command: `--arch` (lstm, transformer), `--seq-len`, `--epochs`, `--patience` (early stopping), `--auto-top-k`, `--risk-aversion`, `--horizons`, `--weighting`, `--no-shrink-cov`, `--checkpoint`.
 - `--top`: number of tickers to display.
+- `--config`: load YAML/JSON config (values in the file override CLI flags).
+- `backtest` command: run walk-forward validation and print a Sharpe/return report.
 
 Example output (truncated):
 ```
-Rank  Ticker  Predicted Return  Weight  Markowitz Wt  Method        Samples  CV RMSE  Latest Date
----------------------------------------------------------------------------------------------------
-   1  MSFT              0.45%   48.18%        50.12%  random_forest        15   0.012  2024-01-30
-   2  AAPL              0.39%   41.10%        32.88%  random_forest        15   0.014  2024-01-30
+Rank  Ticker  Horizon  Predicted Return  Weight  Markowitz Wt  Method        Samples  CV RMSE  Sharpe  Latest Date
+---------------------------------------------------------------------------------------------------------------------------------------
+   1  MSFT       1d            0.45%   48.18%        50.12%  random_forest        15   0.012   0.522  2024-01-30
+   2  AAPL       5d            0.39%   41.10%        32.88%  random_forest        15   0.014   0.417  2024-01-30
 
 Best portfolio choice:
 - MSFT | predicted 0.45% | Markowitz weight 50.12%
@@ -60,11 +73,13 @@ Dates should be ISO-8601, tickers are case-insensitive, and prices should be num
 
 ## How it works
 
-- Feature engineering: multi-horizon returns and momentum, EMA ratios, short/medium volatility, volatility-regime flag, moving-average ratio.
+- Feature engineering: multi-horizon returns, RSI/MACD/Bollinger, EMA ratios, short/medium volatility, volatility-regime flag, moving-average ratio.
 - Auto feature selection: RandomForest importances keep the strongest factors.
-- Cross-validation: optional time-series CV RMSE per ticker.
-- Models: classical (RandomForest, Linear, Ridge, GBRT) and deep (LSTM or Transformer sequence models).
-- Allocation: Markowitz-style weights from predicted returns and historical covariance, alongside score-based weights.
+- Validation: time-series CV, walk-forward validation, backtest report with Sharpe/cumulative return.
+- Models: classical (RandomForest, Linear, Ridge, GBRT) and deep (LSTM or Transformer with GELU, dropout, layer norm, early stopping, checkpoints, loss logging).
+- Allocation: Markowitz (Ledoit–Wolf shrinkage), risk-parity, and Black–Litterman options.
+- Dashboard: Streamlit UI with multi-horizon forecasts and attention heatmaps for Transformer runs.
+- Config: load YAML/JSON configs to drive the CLI; optional model checkpoint save/load.
 
 ## Notes
 

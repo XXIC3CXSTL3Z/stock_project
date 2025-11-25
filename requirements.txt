@@ -3,3 +3,7 @@ numpy
 scikit-learn
 yfinance
 torch
+pyyaml
+tqdm
+matplotlib
+streamlit

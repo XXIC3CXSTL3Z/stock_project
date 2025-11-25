@@ -1,14 +1,14 @@
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from .data import load_price_data
-from .deep import predict_sequence_model, train_sequence_model
+from .deep import load_checkpoint, predict_sequence_model, train_sequence_model, visualize_attention
 from .features import engineer_features
 from .fetch import fetch_latest_prices
-from .model import select_top_features, train_and_predict
-from .portfolio import markowitz_weights
+from .model import select_top_features, train_and_predict, tune_hyperparameters
+from .portfolio import black_litterman_weights, markowitz_weights, risk_parity_weights
 
 
 def generate_recommendations(
@@ -21,41 +21,84 @@ def generate_recommendations(
     cv_folds: int = 0,
     use_markowitz: bool = True,
     risk_aversion: float = 1.0,
+    horizons: Sequence[int] = (1, 5, 10),
+    sharpe_ranking: bool = True,
+    shrink_cov: bool = True,
+    weighting: str = "markowitz",
+    checkpoint_dir: Optional[Path] = None,
+    load_checkpoints: bool = False,
+    hyper_grid: Optional[Sequence[str]] = None,
+    crypto: bool = False,
 ) -> pd.DataFrame:
     """End-to-end orchestration to produce ranked investment ideas."""
     if tickers:
-        prices = fetch_latest_prices(tickers, period=period)
+        prices = fetch_latest_prices(tickers, period=period, crypto=crypto)
     elif data_path:
         prices = load_price_data(data_path)
     else:
         raise ValueError("Provide either a data CSV path or a list of tickers to fetch.")
 
-    train_df, latest_df, feature_cols = engineer_features(prices)
+    train_df, latest_df, feature_cols = engineer_features(prices, horizons=horizons)
 
     if auto_feature_k and len(feature_cols) > auto_feature_k:
-        feature_cols = select_top_features(train_df, feature_cols, top_k=auto_feature_k)
+        feature_cols = select_top_features(
+            train_df, feature_cols, top_k=auto_feature_k, target_col="target_return_1d"
+        )
 
     if train_df.empty or latest_df.empty:
         raise ValueError("Not enough rows to build features and targets. Add more history.")
 
-    predictions = train_and_predict(
-        train_df=train_df,
-        latest_df=latest_df,
-        feature_cols=feature_cols,
-        model_type=model_type,
-        cv_folds=cv_folds,
-    )
+    horizon_frames = []
+    for horizon in horizons:
+        target_col = f"target_return_{horizon}d"
+        preds_h = train_and_predict(
+            train_df=train_df,
+            latest_df=latest_df,
+            feature_cols=feature_cols,
+            model_type=model_type,
+            cv_folds=cv_folds,
+            target_col=target_col,
+            horizon_label=f"{horizon}d",
+            sharpe_ranking=sharpe_ranking,
+            checkpoint_dir=checkpoint_dir,
+            load_checkpoints=load_checkpoints,
+        )
 
-    predictions["markowitz_weight"] = 0.0
-    if use_markowitz and not predictions.empty:
-        weights = markowitz_weights(predictions, prices, risk_aversion=risk_aversion)
-        if not weights.empty:
-            predictions["markowitz_weight"] = predictions["ticker"].map(weights).fillna(0.0)
+        preds_h["markowitz_weight"] = 0.0
+        if use_markowitz and not preds_h.empty:
+            if weighting == "risk_parity":
+                weights = risk_parity_weights(prices)
+            elif weighting == "black_litterman":
+                weights = black_litterman_weights(
+                    preds_h, prices, risk_aversion=risk_aversion, shrink=shrink_cov
+                )
+            else:
+                weights = markowitz_weights(
+                    preds_h, prices, risk_aversion=risk_aversion, shrink=shrink_cov
+                )
+            if not weights.empty:
+                preds_h["markowitz_weight"] = preds_h["ticker"].map(weights).fillna(0.0)
 
-    if top_n is not None:
-        predictions = predictions.head(top_n)
-    _normalize_column(predictions, "recommended_weight")
-    _normalize_column(predictions, "markowitz_weight")
+        if top_n is not None:
+            preds_h = preds_h.head(top_n)
+        _normalize_column(preds_h, "recommended_weight")
+        _normalize_column(preds_h, "markowitz_weight")
+        horizon_frames.append(preds_h)
+
+    if not horizon_frames:
+        return pd.DataFrame()
+
+    predictions = pd.concat(horizon_frames, ignore_index=True)
+
+    if hyper_grid:
+        tuning = tune_hyperparameters(
+            train_df=train_df,
+            feature_cols=feature_cols,
+            model_grid=hyper_grid,
+            target_col="target_return_1d",
+            cv_folds=cv_folds or 3,
+        )
+        predictions.attrs["tuning_results"] = tuning
 
     return predictions
 
@@ -71,51 +114,113 @@ def generate_deep_recommendations(
     use_markowitz: bool = True,
     risk_aversion: float = 1.0,
     top_n: Optional[int] = 5,
+    horizons: Sequence[int] = (1, 5, 10),
+    shrink_cov: bool = True,
+    weighting: str = "markowitz",
+    checkpoint_path: Optional[Path] = None,
+    load_checkpoint: bool = False,
+    patience: int = 5,
+    log_progress: bool = True,
+    crypto: bool = False,
+    attention_dir: Optional[Path] = Path("artifacts"),
 ) -> pd.DataFrame:
     """Train an LSTM/Transformer on sequences of engineered features and rank tickers."""
     if tickers:
-        prices = fetch_latest_prices(tickers, period=period)
+        prices = fetch_latest_prices(tickers, period=period, crypto=crypto)
     elif data_path:
         prices = load_price_data(data_path)
     else:
         raise ValueError("Provide either a data CSV path or a list of tickers to fetch.")
 
-    train_df, _, feature_cols = engineer_features(prices)
+    train_df, _, feature_cols = engineer_features(prices, horizons=horizons)
     if auto_feature_k and len(feature_cols) > auto_feature_k:
-        feature_cols = select_top_features(train_df, feature_cols, top_k=auto_feature_k)
+        feature_cols = select_top_features(
+            train_df, feature_cols, top_k=auto_feature_k, target_col="target_return_1d"
+        )
 
-    model, mean, std = train_sequence_model(
-        train_df=train_df,
-        feature_cols=feature_cols,
-        seq_len=seq_len,
-        arch=arch,
-        epochs=epochs,
-    )
-    predictions = predict_sequence_model(
-        model=model,
-        df=train_df,
-        feature_cols=feature_cols,
-        mean=mean,
-        std=std,
-        seq_len=seq_len,
-        method=f"deep_{arch}",
-    )
-
+    horizon_frames = []
     latest_dates = train_df.groupby("ticker")["date"].max()
-    predictions["latest_date"] = predictions["ticker"].map(latest_dates)
+    for horizon in horizons:
+        target_col = f"target_return_{horizon}d"
+        model = None
+        mean = None
+        std = None
+        history = []
+        target_std = float(train_df[target_col].std()) if len(train_df) > 1 else 0.0
+        if load_checkpoint and checkpoint_path and checkpoint_path.exists():
+            model, payload = load_checkpoint(checkpoint_path, arch=arch, input_size=len(feature_cols))
+            mean = payload["mean"]
+            std = payload["std"]
+        else:
+            model, mean, std, history = train_sequence_model(
+                train_df=train_df,
+                feature_cols=feature_cols,
+                seq_len=seq_len,
+                arch=arch,
+                epochs=epochs,
+                target_col=target_col,
+                patience=patience,
+                checkpoint_path=checkpoint_path,
+                log_progress=log_progress,
+            )
+        preds_h = predict_sequence_model(
+            model=model,
+            df=train_df,
+            feature_cols=feature_cols,
+            mean=mean,
+            std=std,
+            seq_len=seq_len,
+            method=f"deep_{arch}",
+            horizon_label=f"{horizon}d",
+        )
 
-    predictions["markowitz_weight"] = 0.0
-    if use_markowitz and not predictions.empty:
-        weights = markowitz_weights(predictions, prices, risk_aversion=risk_aversion)
-        if not weights.empty:
-            predictions["markowitz_weight"] = predictions["ticker"].map(weights).fillna(0.0)
+        preds_h["latest_date"] = preds_h["ticker"].map(latest_dates)
+        if target_std > 0:
+            preds_h["sharpe_score"] = preds_h["predicted_return"] / (target_std + 1e-6)
+            preds_h = preds_h.sort_values("sharpe_score", ascending=False).reset_index(drop=True)
+            preds_h["rank"] = preds_h.index + 1
+        preds_h["markowitz_weight"] = 0.0
+        if use_markowitz and not preds_h.empty:
+            if weighting == "risk_parity":
+                weights = risk_parity_weights(prices)
+            elif weighting == "black_litterman":
+                weights = black_litterman_weights(
+                    preds_h, prices, risk_aversion=risk_aversion, shrink=shrink_cov
+                )
+            else:
+                weights = markowitz_weights(
+                    preds_h, prices, risk_aversion=risk_aversion, shrink=shrink_cov
+                )
+            if not weights.empty:
+                preds_h["markowitz_weight"] = preds_h["ticker"].map(weights).fillna(0.0)
 
-    if top_n is not None:
-        predictions = predictions.head(top_n)
-    _normalize_column(predictions, "recommended_weight")
-    _normalize_column(predictions, "markowitz_weight")
+        if top_n is not None:
+            preds_h = preds_h.head(top_n)
+        _normalize_column(preds_h, "recommended_weight")
+        _normalize_column(preds_h, "markowitz_weight")
+        preds_h.attrs["history"] = history
+        preds_h.attrs["model"] = model
+        preds_h.attrs["mean"] = mean
+        preds_h.attrs["std"] = std
 
-    return predictions
+        if attention_dir and hasattr(model, "attn_weights"):
+            path = Path(attention_dir) / f"attention_{arch}_{horizon}d.png"
+            saved = visualize_attention(getattr(model, "attn_weights"), path)
+            if saved:
+                preds_h.attrs["attention_path"] = saved
+
+        horizon_frames.append(preds_h)
+
+    if not horizon_frames:
+        return pd.DataFrame()
+
+    result = pd.concat(horizon_frames, ignore_index=True)
+    # bubble up last attention path for dashboards
+    for frame in horizon_frames[::-1]:
+        if "attention_path" in frame.attrs:
+            result.attrs["attention_path"] = frame.attrs["attention_path"]
+            break
+    return result
 
 
 def _normalize_column(df: pd.DataFrame, column: str) -> None:
@@ -133,11 +238,12 @@ def format_recommendations(predictions: pd.DataFrame) -> str:
         return "No recommendations available."
 
     lines = [
-        "Rank  Ticker  Predicted Return  Weight  Markowitz Wt  Method        Samples  CV RMSE  Latest Date",
-        "-" * 115,
+        "Rank  Ticker  Horizon  Predicted Return  Weight  Markowitz Wt  Method        Samples  CV RMSE  Sharpe  Latest Date",
+        "-" * 135,
     ]
     for _, row in predictions.iterrows():
         cv_display = f"{row['cv_rmse']:.4f}" if pd.notna(row.get("cv_rmse")) else "-"
+        sharpe_display = f"{row['sharpe_score']:.3f}" if pd.notna(row.get("sharpe_score")) else "-"
         latest_display = (
             pd.to_datetime(row["latest_date"]).date()
             if "latest_date" in row and pd.notna(row.get("latest_date"))
@@ -147,12 +253,14 @@ def format_recommendations(predictions: pd.DataFrame) -> str:
         lines.append(
             f"{int(row['rank']):>4}  "
             f"{row['ticker']:<6}  "
+            f"{row.get('horizon','-'):>7}  "
             f"{row['predicted_return']*100:>15.2f}%  "
             f"{row['recommended_weight']*100:>6.2f}%  "
             f"{row['markowitz_weight']*100:>12.2f}%  "
             f"{method_display:<12}  "
             f"{int(row['samples']):>7}  "
             f"{cv_display:>7}  "
+            f"{sharpe_display:>6}  "
             f"{latest_display}"
         )
 

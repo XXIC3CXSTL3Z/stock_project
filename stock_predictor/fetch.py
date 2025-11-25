@@ -8,6 +8,7 @@ def fetch_latest_prices(
     tickers: Iterable[str],
     period: str = "6mo",
     interval: str = "1d",
+    crypto: bool = False,
 ) -> pd.DataFrame:
     """
     Download recent OHLC data and return a normalized price DataFrame.
@@ -16,8 +17,17 @@ def fetch_latest_prices(
         tickers: iterable of ticker symbols.
         period: lookback window supported by yfinance (e.g., 1mo, 3mo, 6mo, 1y).
         interval: bar interval (1d recommended for this demo).
+        crypto: when True, auto-append -USD to bare crypto tickers for yfinance.
     """
-    symbols: List[str] = [t.strip().upper() for t in tickers if t.strip()]
+    symbols: List[str] = []
+    for t in tickers:
+        symbol = t.strip().upper()
+        if not symbol:
+            continue
+        if crypto and "-" not in symbol:
+            symbol = f"{symbol}-USD"
+        symbols.append(symbol)
+
     if not symbols:
         raise ValueError("No tickers provided for live fetch.")
 
