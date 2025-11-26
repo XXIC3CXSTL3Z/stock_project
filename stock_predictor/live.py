@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 import time
 from typing import Callable, Iterable, Optional
@@ -8,17 +9,34 @@ import requests
 from .recommend import format_recommendations, generate_recommendations
 
 
+def _format_alert_message(message: str, title: str = "Stock Signals") -> tuple[str, str]:
+    """Pretty-print the table as a code block for Discord and Telegram."""
+    text = message.strip()
+    discord_msg = f"**{title}**\n```\n{text}\n```"
+    telegram_msg = f"<b>{html.escape(title)}</b>\n<pre>{html.escape(text)}</pre>"
+    return discord_msg, telegram_msg
+
+
 def send_alert(message: str, discord_url: Optional[str] = None, telegram_token: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> None:
     """Send a message to Discord and/or Telegram if webhooks are provided."""
+    discord_msg, telegram_msg = _format_alert_message(message)
     try:
         if discord_url:
-            requests.post(discord_url, json={"content": message}, timeout=5)
+            requests.post(discord_url, json={"content": discord_msg}, timeout=5)
     except Exception:
         pass
     try:
         if telegram_token and telegram_chat_id:
             url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-            requests.post(url, data={"chat_id": telegram_chat_id, "text": message}, timeout=5)
+            requests.post(
+                url,
+                data={
+                    "chat_id": telegram_chat_id,
+                    "text": telegram_msg,
+                    "parse_mode": "HTML",
+                },
+                timeout=5,
+            )
     except Exception:
         pass
 

@@ -41,3 +41,31 @@ def test_run_live_passes_webhook_env(monkeypatch):
         "telegram_token": "TOKEN123",
         "telegram_chat_id": "456",
     }
+
+
+def test_send_alert_formats_pretty(monkeypatch):
+    sent = []
+
+    class DummyResp:
+        ok = True
+
+    def fake_post(url, json=None, data=None, timeout=None):
+        sent.append({"url": url, "json": json, "data": data})
+        return DummyResp()
+
+    monkeypatch.setattr(live.requests, "post", fake_post)
+
+    live.send_alert(
+        "Rank  Ticker\n 1   AAPL",
+        discord_url="https://discord.test/webhook",
+        telegram_token="TOKEN123",
+        telegram_chat_id="456",
+    )
+
+    discord_payload = sent[0]["json"]["content"]
+    telegram_payload = sent[1]["data"]
+
+    assert discord_payload.startswith("**Stock Signals**")
+    assert "```" in discord_payload
+    assert telegram_payload["parse_mode"] == "HTML"
+    assert "<pre>" in telegram_payload["text"]
