@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional
@@ -583,10 +584,15 @@ def run_live(args: argparse.Namespace) -> Optional[int]:
         horizon_weights=horizon_weights,
         crypto=args.crypto,
     )
+    webhook_kwargs = dict(
+        discord_url=os.getenv("SP_DISCORD_WEBHOOK"),
+        telegram_token=os.getenv("SP_TELEGRAM_TOKEN"),
+        telegram_chat_id=os.getenv("SP_TELEGRAM_CHAT"),
+    )
     if args.loop:
         live_signal_loop(tickers=args.symbols, period=args.period, **live_kwargs)
     else:
-        preds = live_signal_once(tickers=args.symbols, period=args.period, **live_kwargs)
+        preds = live_signal_once(tickers=args.symbols, period=args.period, **live_kwargs, **webhook_kwargs)
         print(format_recommendations(preds))
     return 0
 
