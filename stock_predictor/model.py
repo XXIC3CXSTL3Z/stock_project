@@ -86,7 +86,8 @@ def _cross_val_rmse(
         y_train, y_test = y_all.iloc[train_idx], y_all.iloc[test_idx]
         reg.fit(X_train, y_train)
         preds = reg.predict(X_test)
-        rmse = mean_squared_error(y_test, preds, squared=False)
+        mse = mean_squared_error(y_test, preds)
+        rmse = float(np.sqrt(mse))
         scores.append(rmse)
 
     return float(np.mean(scores)) if scores else None

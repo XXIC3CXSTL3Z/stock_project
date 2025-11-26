@@ -77,7 +77,7 @@ def _beta_and_corr(
     for col in benchmark_returns.columns:
         bench = benchmark_returns[col]
         cov = asset_returns.rolling(window).cov(bench)
-        var = bench.rolling(window).var()
+        var = bench.rolling(window).std(ddof=0) ** 2
         cols[f"beta_{col.lower()}"] = cov / (var + 1e-9)
         cols[f"corr_{col.lower()}"] = asset_returns.rolling(window).corr(bench)
     return pd.DataFrame(cols)
@@ -119,10 +119,10 @@ def engineer_features(
         bench_rets.index = pd.to_datetime(bench_rets.index)
 
     def _per_ticker(group: pd.DataFrame) -> pd.DataFrame:
-        group = group.sort_values("date").copy()
-        group["return_1d"] = group["close"].pct_change(1)
-        group["return_5d"] = group["close"].pct_change(short_window)
-        group["return_10d"] = group["close"].pct_change(mid_window)
+        group = group.sort_values("date").reset_index(drop=True)
+        group["return_1d"] = group["close"].pct_change(1, fill_method=None)
+        group["return_5d"] = group["close"].pct_change(short_window, fill_method=None)
+        group["return_10d"] = group["close"].pct_change(mid_window, fill_method=None)
         group["momentum_5d"] = (group["close"] - group["close"].shift(short_window)) / group[
             "close"
         ].shift(short_window)
@@ -155,12 +155,15 @@ def engineer_features(
 
         if bench_rets is not None:
             aligned = bench_rets.reindex(group["date"]).ffill()
-            beta_df = _beta_and_corr(group["return_1d"], aligned, window=long_window)
+            asset_returns = group["return_1d"].copy()
+            asset_returns.index = group["date"]
+            beta_df = _beta_and_corr(asset_returns, aligned, window=long_window)
+            beta_df.index = group.index
             group = pd.concat([group, beta_df], axis=1)
 
         if crypto:
             group["weekend_flag"] = (group["date"].dt.dayofweek >= 5).astype(float)
-            group["overnight_return"] = group["close"].pct_change().where(group["weekend_flag"] == 0)
+            group["overnight_return"] = group["close"].pct_change(fill_method=None).where(group["weekend_flag"] == 0)
         else:
             group["weekend_flag"] = 0.0
             group["overnight_return"] = group["return_1d"]
@@ -170,7 +173,7 @@ def engineer_features(
 
         # Multi-horizon targets: pct change over horizon, shifted to align with prediction time.
         for horizon in horizons:
-            group[f"target_return_{horizon}d"] = group["close"].pct_change(horizon).shift(-horizon)
+            group[f"target_return_{horizon}d"] = group["close"].pct_change(horizon, fill_method=None).shift(-horizon)
 
         return group
 
