@@ -121,11 +121,18 @@ def train_and_predict(
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     for ticker, ticker_train in train_df.groupby("ticker"):
-        ticker_latest = latest_df[latest_df["ticker"] == ticker]
+        ticker_latest = latest_df[latest_df["ticker"] == ticker].copy()
+        ticker_latest.replace([np.inf, -np.inf], np.nan, inplace=True)
         if ticker_latest.empty:
             continue
+        ticker_train = ticker_train.replace([np.inf, -np.inf], np.nan)
         ticker_train = ticker_train.dropna(subset=feature_cols + [target_col])
+        ticker_latest = ticker_latest.dropna(subset=feature_cols)
         if ticker_train.empty:
+            continue
+        if ticker_latest.empty:
+            continue
+        if not np.isfinite(ticker_latest[feature_cols]).all(axis=None):
             continue
 
         X = ticker_train[feature_cols]

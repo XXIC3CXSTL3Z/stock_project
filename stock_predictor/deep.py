@@ -242,6 +242,7 @@ def train_sequence_model(
 ) -> tuple[nn.Module, np.ndarray, np.ndarray, List[dict]]:
     """Train an LSTM/Transformer/CNN-LSTM on sliding windows with logging + checkpoints."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    train_df = train_df.replace([np.inf, -np.inf], np.nan)
     train_df = train_df.dropna(subset=list(feature_cols) + [target_col]).copy()
 
     X, y = _prepare_sequences(train_df, feature_cols, seq_len, target_col=target_col)
@@ -377,6 +378,7 @@ def predict_sequence_model(
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     feature_cols = list(feature_cols)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=feature_cols + ["ticker", "date"])
     if normalization_check:
         _assert_normalization(mean, std, feature_cols)
 

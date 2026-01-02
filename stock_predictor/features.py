@@ -1,5 +1,6 @@
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -221,10 +222,13 @@ def engineer_features(
         df = pd.DataFrame(columns=model_columns)
 
     df = df[model_columns]
-
-    df[feature_cols] = df[feature_cols].fillna(0.0)
+    df[feature_cols + target_cols] = df[feature_cols + target_cols].apply(pd.to_numeric, errors="coerce")
+    df[feature_cols + target_cols] = df[feature_cols + target_cols].replace([np.inf, -np.inf], np.nan)
+    df[feature_cols] = df[feature_cols].clip(lower=-1e6, upper=1e6)
+    df[feature_cols] = df[feature_cols].fillna(0.0).astype(float)
 
     train_df = df.dropna(subset=feature_cols).reset_index(drop=True)
+    train_df = train_df[np.isfinite(train_df[feature_cols]).all(axis=1)]
     if rolling_norm_window:
         normalized_parts = []
         for _, grp in train_df.groupby("ticker"):
@@ -237,5 +241,6 @@ def engineer_features(
 
     latest_df = df.sort_values("date").groupby("ticker").tail(1).copy()
     latest_df = latest_df.dropna(subset=feature_cols).reset_index(drop=True)
+    latest_df = latest_df[np.isfinite(latest_df[feature_cols]).all(axis=1)]
 
     return train_df, latest_df, feature_cols
